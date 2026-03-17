@@ -1,0 +1,31 @@
+{
+  "config": {
+    "input_dim": 6,
+    "hidden_dim": 512,
+    "num_hidden_layers": 2,
+    "regression_output_dim": 6,
+    "num_classes": 6,
+    "dropout_rate": 0.0006169852478493452,
+    "use_batch_norm": false,
+    "optimizer": "AdamW",
+    "learning_rate_adam": 0.0009730645787145199,
+    "weight_decay": 2.3208559094469034e-05,
+    "momentum": 0.9089921738980175,
+    "batch_size": 32,
+    "num_epochs": 1000,
+    "classification_weight": 0.4433634714475637,
+    "regression_weight": 1.432132236791528
+  },
+  "best_epoch": 74,
+  "total_epochs_trained": 1000,
+  "val": {
+    "mae": 0.07228714227676392,
+    "f1": 0.9309051665043807,
+    "acc": 0.9559706470980653
+  },
+  "test": {
+    "mae": 0.07046860456466675,
+    "f1": 0.9277146599646994,
+    "acc": 0.9549699799866578
+  }
+}
