@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""
+PS-side DMA driver for PickleballNet on Ultra96 (PYNQ).
+
+Runs on the ARM A53 cores. Communicates with the PL-side HLS IP
+via AXI DMA over AXI-Stream.
+
+Data Flow:
+  PS packs 6 raw float32 values into DMA input buffer
+  → AXI DMA MM2S → AXI-Stream → HLS IP (pb_predict)
+  → HLS IP scales inputs on-chip, runs INT8 MLP inference
+  → AXI-Stream → AXI DMA S2MM → PS reads 12 float32 outputs
+
+The FPGA handles:
+  - StandardScaler normalisation (on-chip, baked into weights.h)
+  - INT8 quantized MLP trunk inference (BN fused)
+  - Regression head (output inverse-scaled to real units on-chip)
+  - Classification head (raw logits)
+
+The PS (this driver) handles:
+  - Packing raw sensor values as float32 into DMA buffer
+  - Triggering DMA transfer
+  - Reading float32 outputs from DMA buffer
+  - Argmax on classification logits
+  - Timing measurements
+
+Requires:
+  - PYNQ image (2.7+) on Ultra96
+  - Overlay .bit + .hwh from Vivado build (base names must match!)
+  - Run with: sudo -E /usr/local/share/pynq-venv/bin/python
+
+Usage:
+    from ps_dma_driver import PickleballPredictor
+    pred = PickleballPredictor("design_1_wrapper.bit")
+    reg_out, cls_idx, cls_name = pred.predict([16.33, 18.37, 1.05, -11.01, -8.82, 0.63])
+"""
+
+import time
+import numpy as np
+
+try:
+    from pynq import Overlay, allocate, MMIO
+except ImportError:
+    print("WARNING: PYNQ not available. This module only works on Ultra96.")
+    Overlay = None
+    allocate = None
+    MMIO = None
+
+
+CLASS_NAMES = ['Drive', 'Drop', 'Dink', 'Lob', 'SpeedUp', 'HandBattle']
+
+# I/O dimensions (must match HLS: IN_DIM=6, OUT_REG=6, OUT_CLS=6)
+N_INPUT = 6
+N_REG_OUTPUT = 6       # regression outputs (real units, inverse-scaled on FPGA)
+N_CLS_OUTPUT = 6       # classification logits
+N_TOTAL_OUTPUT = N_REG_OUTPUT + N_CLS_OUTPUT  # 12
+
+# ── DMA Register Offsets (Direct Register / Simple Mode) ─────────────────────
+# PYNQ's DMA class incorrectly uses _SGDMAChannel even when SG is disabled,
+# so we program the registers directly via MMIO.
+MM2S_DMACR  = 0x00   # MM2S Control
+MM2S_DMASR  = 0x04   # MM2S Status
+MM2S_SA     = 0x18   # MM2S Source Address (low 32)
+MM2S_SA_MSB = 0x1C   # MM2S Source Address (high 32)
+MM2S_LENGTH = 0x28   # MM2S Transfer Length (triggers transfer)
+S2MM_DMACR  = 0x30   # S2MM Control
+S2MM_DMASR  = 0x34   # S2MM Status
+S2MM_DA     = 0x48   # S2MM Dest Address (low 32)
+S2MM_DA_MSB = 0x4C   # S2MM Dest Address (high 32)
+S2MM_LENGTH = 0x58   # S2MM Transfer Length (triggers transfer)
+
+
+# ── Main predictor class ─────────────────────────────────────────────────────
+
+class PickleballPredictor:
+    """
+    PS-side driver that sends raw sensor data to the PL via AXI DMA
+    and reads back regression + classification results.
+
+    Uses raw MMIO register writes for DMA (bypasses PYNQ's _SGDMAChannel
+    which is incorrectly instantiated for Direct Register mode DMA cores).
+
+    Input should be RAW (un-normalised) sensor values.
+    The FPGA applies StandardScaler on-chip (baked into HLS weights).
+    """
+
+    def __init__(
+        self,
+        bitstream_path: str,
+        dma_name: str = "axi_dma_0",
+    ):
+        """
+        Load the overlay and set up DMA buffers.
+
+        Args:
+            bitstream_path: Path to the .bit file (matching .hwh must be beside it)
+            dma_name: Name of the AXI DMA IP in the block design
+        """
+        if Overlay is None:
+            raise RuntimeError("PYNQ library not available. Run this on Ultra96.")
+
+        # print(f"Loading overlay: {bitstream_path}")
+        self.overlay = Overlay(bitstream_path)
+
+        # Direct MMIO access (bypasses PYNQ's broken _SGDMAChannel)
+        dma_addr = self.overlay.ip_dict[dma_name]['phys_addr']
+        hls_addr = self.overlay.ip_dict['pb_predict_0']['phys_addr']
+        self.dma_mmio = MMIO(dma_addr, 0x100)
+        self.hls_mmio = MMIO(hls_addr, 0x100)
+
+        # Allocate contiguous DMA buffers (float32 = 4 bytes each)
+        self.input_buffer = allocate(shape=(N_INPUT,), dtype=np.float32)
+        self.output_buffer = allocate(shape=(N_TOTAL_OUTPUT,), dtype=np.float32)
+
+        # Reset DMA once at init
+        self._reset_dma()
+
+        # print(f"Overlay loaded. DMA (raw MMIO) ready.")
+        # self._print_ip_info()
+
+    def _reset_dma(self):
+        """Reset both DMA channels."""
+        self.dma_mmio.write(MM2S_DMACR, 0x04)
+        self.dma_mmio.write(S2MM_DMACR, 0x04)
+        time.sleep(0.001)
+
+    def _print_ip_info(self):
+        """Print info about loaded overlay IPs."""
+        print(f"  IPs in overlay: {list(self.overlay.ip_dict.keys())}")
+
+    def predict(self, raw_input: list) -> tuple:
+        """
+        Run one inference through the FPGA.
+
+        Args:
+            raw_input: List/array of 6 floats (RAW sensor values).
+                       FPGA applies StandardScaler on-chip.
+
+        Returns:
+            (reg_output, cls_index, cls_name):
+                reg_output: np.array of 6 floats (regression, real units)
+                cls_index:  int, predicted class
+                cls_name:   str, class name
+        """
+        assert len(raw_input) == N_INPUT, f"Expected {N_INPUT} inputs, got {len(raw_input)}"
+
+        # 0) Halt both DMA channels and clear status from previous transfer.
+        #    Without this, back-to-back transfers see stale Idle bits and
+        #    the DMA re-initialises internally (~68 ms penalty per call).
+        self.dma_mmio.write(MM2S_DMACR, 0x0000)       # Halt MM2S
+        self.dma_mmio.write(S2MM_DMACR, 0x0000)       # Halt S2MM
+        self.dma_mmio.write(MM2S_DMASR, 0x7000)       # W1C interrupt bits
+        self.dma_mmio.write(S2MM_DMASR, 0x7000)       # W1C interrupt bits
+
+        # 1) Pack raw float32 values into DMA input buffer
+        for i in range(N_INPUT):
+            self.input_buffer[i] = np.float32(raw_input[i])
+        self.input_buffer.flush()
+
+        in_phys = self.input_buffer.physical_address
+        out_phys = self.output_buffer.physical_address
+
+        # 2) Start S2MM (recv) — must be ready before HLS produces output
+        self.dma_mmio.write(S2MM_DMACR, 0x0001)       # Run bit
+        self.dma_mmio.write(S2MM_DA,     out_phys & 0xFFFFFFFF)
+        self.dma_mmio.write(S2MM_DA_MSB, (out_phys >> 32) & 0xFFFFFFFF)
+        self.dma_mmio.write(S2MM_LENGTH, self.output_buffer.nbytes)
+
+        # 3) Start HLS IP (ap_start = bit 0)
+        self.hls_mmio.write(0x00, 0x01)
+
+        # 4) Start MM2S (send) — writing LENGTH triggers transfer
+        self.dma_mmio.write(MM2S_DMACR, 0x0001)       # Run bit
+        self.dma_mmio.write(MM2S_SA,     in_phys & 0xFFFFFFFF)
+        self.dma_mmio.write(MM2S_SA_MSB, (in_phys >> 32) & 0xFFFFFFFF)
+        self.dma_mmio.write(MM2S_LENGTH, self.input_buffer.nbytes)
+
+        # 5) Poll for S2MM completion (Idle bit = bit 1) with timeout
+        TIMEOUT_US = 500_000  # 500 ms
+        t_start = time.perf_counter()
+        while True:
+            status = self.dma_mmio.read(S2MM_DMASR)
+            if status & 0x0002:       # Idle — transfer done
+                break
+            if status & 0x0070:       # DMAIntErr | DMASlvErr | DMADecErr
+                self._reset_dma()
+                raise RuntimeError(f"DMA error: S2MM_DMASR=0x{status:08x}")
+            if (time.perf_counter() - t_start) * 1e6 > TIMEOUT_US:
+                mm2s_sr = self.dma_mmio.read(0x04)
+                hls_cr  = self.hls_mmio.read(0x00)
+                self._reset_dma()
+                raise TimeoutError(
+                    f"DMA poll timeout ({TIMEOUT_US} µs). "
+                    f"S2MM_SR=0x{status:08x}, MM2S_SR=0x{mm2s_sr:08x}, HLS_CR=0x{hls_cr:08x}"
+                )
+
+        # 6) Invalidate cache, then parse results
+        self.output_buffer.invalidate()
+        reg_output = np.array(self.output_buffer[:N_REG_OUTPUT], dtype=np.float32)
+        cls_logits = np.array(self.output_buffer[N_REG_OUTPUT:N_TOTAL_OUTPUT], dtype=np.float32)
+        cls_index = int(np.argmax(cls_logits))
+        cls_name = CLASS_NAMES[cls_index] if cls_index < len(CLASS_NAMES) else f"class_{cls_index}"
+
+        return reg_output, cls_index, cls_name
+
+    def predict_timed(self, raw_input: list) -> tuple:
+        """
+        Same as predict() but also returns inference time in microseconds.
+
+        Returns:
+            (reg_output, cls_index, cls_name, time_us)
+        """
+        t0 = time.perf_counter()
+        reg, idx, name = self.predict(raw_input)
+        t1 = time.perf_counter()
+        time_us = (t1 - t0) * 1e6
+        return reg, idx, name, time_us
+
+    def predict_batch(self, inputs: np.ndarray) -> list:
+        """
+        Run inference on multiple samples sequentially.
+
+        Args:
+            inputs: np.ndarray of shape (N, 6) — raw sensor values
+
+        Returns:
+            List of (reg_output, cls_index, cls_name) tuples
+        """
+        results = []
+        for row in inputs:
+            results.append(self.predict(row.tolist()))
+        return results
+
+    def benchmark(self, n_iterations: int = 1000) -> dict:
+        """
+        Benchmark FPGA inference latency.
+
+        Args:
+            n_iterations: Number of inferences to run
+
+        Returns:
+            Dict with timing stats (mean, min, max, std in microseconds)
+        """
+        # Test vector from test_vectors.h, Sample 0: class 0 (Drive)
+        test_input = [16.33, 18.370001, 1.052669, -11.010001, -8.82, 0.632585]
+        times = []
+
+        # Warm up
+        for _ in range(10):
+            self.predict(test_input)
+
+        # Benchmark
+        for _ in range(n_iterations):
+            _, _, _, t = self.predict_timed(test_input)
+            times.append(t)
+
+        times = np.array(times)
+        return {
+            'n_iterations': n_iterations,
+            'mean_us': float(np.mean(times)),
+            'std_us': float(np.std(times)),
+            'min_us': float(np.min(times)),
+            'max_us': float(np.max(times)),
+            'p50_us': float(np.percentile(times, 50)),
+            'p99_us': float(np.percentile(times, 99)),
+            'throughput_hz': float(1e6 / np.mean(times)),
+        }
+
+    def close(self):
+        """Free DMA buffers."""
+        del self.input_buffer
+        del self.output_buffer
+
+
+# =====================================================================
+# Quick test / demo (run on Ultra96 with sudo -E)
+# =====================================================================
+if __name__ == "__main__":
+    import sys
+
+    bitstream = sys.argv[1] if len(sys.argv) > 1 else "design_1.bit"
+    pred = PickleballPredictor(bitstream)
+
+    # Test vector from test_vectors.h, Sample 0: class 0 (Drive)
+    # Raw values — FPGA scales on-chip
+    test_input = [16.33, 18.370001, 1.052669, -11.010001, -8.82, 0.632585]
+
+    # Expected from test_vectors.h:
+    #   reg = [6.213955, 9.685316, 0.728952, 4.642068, 4.561520, 1.831140]
+    #   cls logits = [3.480605, -4.208082, -12.704888, -14.318913, -5.527031, -2.082196]
+    #   pred = class 0 (Drive)
+
+    reg, cls_idx, cls_name, time_us = pred.predict_timed(test_input)
+
+    print(f"\nInput:      {test_input}")
+    print(f"Reg output: {reg}")
+    print(f"Predicted:  {cls_name} (class {cls_idx})")
+    print(f"Latency:    {time_us:.1f} µs")
+
+    # Compare with expected
+    expected_reg = np.array([6.213955, 9.685316, 0.728952, 4.642068, 4.561520, 1.831140])
+    reg_diff = np.abs(reg - expected_reg)
+    print(f"\nReg diff vs golden: {reg_diff}")
+    print(f"Max reg diff:       {reg_diff.max():.6f}")
+
+    # Benchmark
+    print("\nRunning benchmark (1000 iterations)...")
+    stats = pred.benchmark(1000)
+    print(f"  Mean:       {stats['mean_us']:.1f} µs")
+    print(f"  Min/Max:    {stats['min_us']:.1f} / {stats['max_us']:.1f} µs")
+    print(f"  P50/P99:    {stats['p50_us']:.1f} / {stats['p99_us']:.1f} µs")
+    print(f"  Throughput: {stats['throughput_hz']:.0f} inferences/sec")
+
+    pred.close()

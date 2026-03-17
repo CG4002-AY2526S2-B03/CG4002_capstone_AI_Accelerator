@@ -1,0 +1,79 @@
+{
+  "pareto_front": [
+    {
+      "trial": 234,
+      "norm_mae": 0.07807931853479867,
+      "f1": 0.9416794027517886,
+      "params": {
+        "optimizer": "AdamW",
+        "learning_rate_adam": 0.0009730645787145199,
+        "hidden_dim": 512,
+        "dropout_rate": 0.0006169852478493452,
+        "weight_decay": 2.3208559094469034e-05,
+        "momentum": 0.9089921738980175,
+        "classification_weight": 0.4433634714475637,
+        "regression_weight": 1.432132236791528
+      }
+    },
+    {
+      "trial": 252,
+      "norm_mae": 0.08290638456212503,
+      "f1": 0.9464958619826308,
+      "params": {
+        "optimizer": "AdamW",
+        "learning_rate_adam": 0.0004612840099973276,
+        "hidden_dim": 512,
+        "dropout_rate": 0.000733253439172901,
+        "weight_decay": 5.5139057448980315e-05,
+        "momentum": 0.9167594847811062,
+        "classification_weight": 0.8644687104290177,
+        "regression_weight": 1.3867235825335085
+      }
+    },
+    {
+      "trial": 137,
+      "norm_mae": 0.07743089061864258,
+      "f1": 0.9408714557876968,
+      "params": {
+        "optimizer": "AdamW",
+        "learning_rate_adam": 0.0009636876798434834,
+        "hidden_dim": 512,
+        "dropout_rate": 0.0008362489430758183,
+        "weight_decay": 2.554097652661777e-05,
+        "momentum": 0.9263724077651011,
+        "classification_weight": 0.5248189035056045,
+        "regression_weight": 1.5947964139436481
+      }
+    },
+    {
+      "trial": 246,
+      "norm_mae": 0.07963632904577925,
+      "f1": 0.9429357479606417,
+      "params": {
+        "optimizer": "AdamW",
+        "learning_rate_adam": 0.0005932347390382839,
+        "hidden_dim": 512,
+        "dropout_rate": 0.000656746768186228,
+        "weight_decay": 7.731981644860926e-05,
+        "momentum": 0.9079056160144379,
+        "classification_weight": 0.6511084246594099,
+        "regression_weight": 1.3243734900556394
+      }
+    }
+  ],
+  "best_balanced": {
+    "trial": 234,
+    "norm_mae": 0.07807931853479867,
+    "f1": 0.9416794027517886,
+    "params": {
+      "optimizer": "AdamW",
+      "learning_rate_adam": 0.0009730645787145199,
+      "hidden_dim": 512,
+      "dropout_rate": 0.0006169852478493452,
+      "weight_decay": 2.3208559094469034e-05,
+      "momentum": 0.9089921738980175,
+      "classification_weight": 0.4433634714475637,
+      "regression_weight": 1.432132236791528
+    }
+  }
+}
