@@ -67,7 +67,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default=os.path.join(HERE, 'artifacts', 'final_model', 'best_model.pth'))
     parser.add_argument("--scaler", type=str, default=os.path.join(HERE, 'artifacts', 'scaler_params.json'))
-    parser.add_argument("--out", type=str, default=os.path.join(HERE, '..', 'hls_src', 'weights.h'))
+    parser.add_argument("--out", type=str, default=os.path.join(HERE, '..', '..', 'CG4002_capstone_hls', 'weights.h'))
     args = parser.parse_args()
 
     cfg = DEFAULT_CONFIG

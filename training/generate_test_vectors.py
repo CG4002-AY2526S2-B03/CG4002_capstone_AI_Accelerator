@@ -59,7 +59,7 @@ def main():
     parser.add_argument("--data", default=os.path.join(HERE, 'artifacts', 'splits.npz'))
     parser.add_argument("--scaler", default=os.path.join(HERE, 'artifacts', 'scaler_params.json'))
     parser.add_argument("--n_per_class", type=int, default=3)
-    parser.add_argument("--out", default=os.path.join(HERE, '..', 'hls_src', 'test_vectors.h'))
+    parser.add_argument("--out", default=os.path.join(HERE, '..', '..', 'CG4002_capstone_hls', 'test_vectors.h'))
     args = parser.parse_args()
 
     np.random.seed(SEED)

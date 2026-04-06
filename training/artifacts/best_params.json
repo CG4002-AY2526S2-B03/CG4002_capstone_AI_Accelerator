@@ -1,0 +1,94 @@
+{
+  "pareto_front": [
+    {
+      "trial": 28,
+      "norm_mae": 0.2541249971151849,
+      "f1": 0.9564450714637046,
+      "params": {
+        "optimizer": "AdamW",
+        "learning_rate_adam": 0.0008412975824131748,
+        "hidden_dim": 512,
+        "dropout_rate": 0.09709911173378932,
+        "weight_decay": 5.4089304897610235e-05,
+        "momentum": 0.8437243794891315,
+        "classification_weight": 0.5525647489544885,
+        "regression_weight": 0.9011335806834733
+      }
+    },
+    {
+      "trial": 41,
+      "norm_mae": 0.25441247855620774,
+      "f1": 0.9577486323055361,
+      "params": {
+        "optimizer": "AdamW",
+        "learning_rate_adam": 0.000991993228579689,
+        "hidden_dim": 512,
+        "dropout_rate": 0.05752635148523599,
+        "weight_decay": 0.00015566845136781972,
+        "momentum": 0.8343214384521759,
+        "classification_weight": 0.8430231406299428,
+        "regression_weight": 1.0029326391019808
+      }
+    },
+    {
+      "trial": 45,
+      "norm_mae": 0.2521143579170866,
+      "f1": 0.9548720465163009,
+      "params": {
+        "optimizer": "AdamW",
+        "learning_rate_adam": 0.0009694127904209626,
+        "hidden_dim": 512,
+        "dropout_rate": 0.019615294572346204,
+        "weight_decay": 8.974581423128095e-05,
+        "momentum": 0.8537044714709248,
+        "classification_weight": 0.9606258793266456,
+        "regression_weight": 1.2594995581638113
+      }
+    },
+    {
+      "trial": 497,
+      "norm_mae": 0.2526554915340293,
+      "f1": 0.9560210632111805,
+      "params": {
+        "optimizer": "AdamW",
+        "learning_rate_adam": 0.0009772846496743657,
+        "hidden_dim": 512,
+        "dropout_rate": 0.022496700536616093,
+        "weight_decay": 0.00010412761976420437,
+        "momentum": 0.8500860754735695,
+        "classification_weight": 0.8304741819239176,
+        "regression_weight": 1.2972845450447499
+      }
+    },
+    {
+      "trial": 750,
+      "norm_mae": 0.24854941880591733,
+      "f1": 0.954735221498332,
+      "params": {
+        "optimizer": "AdamW",
+        "learning_rate_adam": 0.0006346940076436242,
+        "hidden_dim": 512,
+        "dropout_rate": 0.005503992507239749,
+        "weight_decay": 0.00010833783091312043,
+        "momentum": 0.9496519776773024,
+        "classification_weight": 0.4544298718159938,
+        "regression_weight": 1.9121741764167215
+      }
+    }
+  ],
+  "best_balanced": {
+    "trial": 750,
+    "norm_mae": 0.24854941880591733,
+    "f1": 0.954735221498332,
+    "params": {
+      "optimizer": "AdamW",
+      "learning_rate_adam": 0.0006346940076436242,
+      "hidden_dim": 512,
+      "dropout_rate": 0.005503992507239749,
+      "weight_decay": 0.00010833783091312043,
+      "momentum": 0.9496519776773024,
+      "classification_weight": 0.4544298718159938,
+      "regression_weight": 1.9121741764167215
+    }
+  }
+}

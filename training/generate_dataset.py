@@ -1,37 +1,3 @@
-"""
-Pickleball Shot Dataset Generator — v1.0
-=========================================
-Generates a physically grounded synthetic dataset for training a bot AI
-that predicts where to move and what shot to return.
-
-Physics profiles (set PHYSICS_PROFILE below):
-  main_scene     — MainScene.unity:    Ball2 uses bounce.physicMaterial
-                   COR=1.0, friction=0.0
-  prefab_default — GameSpaceRoot.prefab: Ball2 has no material (Unity defaults)
-                   COR=0.5, friction=0.3
-
-Constants sourced from project files:
-  TimeManager.asset       Fixed Timestep     0.02 s
-  DynamicsManager.asset   gravity            -9.81, bounceThreshold 2.0
-  BallAerodynamics.cs     dragCoefficient    0.040
-                          magnusCoefficient  0.00075
-                          maxAngularSpeed    80.0 rad/s
-  GameSpaceRoot.prefab    Ball2 m_AngularDrag 0.05
-  PaddleHitController.cs  maxBallSpeed       22.0 m/s
-  bounce.physicMaterial   bounciness 1.0, friction 0.0
-  Unity material default  bounciness 0.0, friction 0.6
-
-Coordinate system (PracticeBallController.cs):
-  x  lateral   [-3.5, 3.5]   centre = 0
-  y  height    [0, ~10]      0 = court surface
-  z  depth     [-4, 12]      net at z=4, player side z<4, bot side z>4
-
-Output files (saved to ./data/):
-  pickleball_shot_dataset.csv    — 13 cols, return execution model
-  pickleball_policy_dataset.csv  — 8 cols, shot selection model
-  pickleball_shot_dataset_debug.csv — all cols including debug fields
-"""
-
 import numpy as np
 import pandas as pd
 import math
@@ -58,32 +24,48 @@ def get_profile():
     return p["bounce_e"], p["bounce_mu"], p["note"]
 
 
-GRAVITY           = -9.81
+#Physics constants
+GRAVITY           = -9.81    #acts on AI z (height)
 SIM_DT            = 0.02
-BOUNCE_THRESHOLD  = 2.0
+BOUNCE_THRESHOLD  = 2.0      #normal component (AI z) at floor
 DRAG_COEFF        = 0.040
 MAGNUS_COEFF      = 0.00075
 MAX_ANGULAR_SPEED = 80.0
 ANGULAR_DRAG      = 0.05
 MAX_BALL_SPEED    = 22.0
-NET_Z             = 4.0
-NET_HEIGHT        = 0.86
-NET_CLEARANCE     = NET_HEIGHT + 0.10
-COURT_X_HALF      = 3.5
-BOT_BASELINE      = 12.0
-BOT_NVZ_Z         = 6.13
-BOT_INTERCEPT_Z   = 6.0
-BOT_INTERCEPT_Y   = (0.45, 1.50)
 
-ATTEMPT_BUDGET    = 45_500
+#Court geometry in AI frame (x=right, y=depth, z=height)
+NET_Y             = 5.4      #net plane depth (CourtBoundarySetup: localPosition.z=5.4)
+NET_TOP_Z         = 0.9      #net top height (localPosition.y=0.45, size.y=0.9 -> top=0.9)
+NET_CLEARANCE_Z   = NET_TOP_Z + 0.10   #sampling safety margin only, not used in sim
+FLOOR_Z           = 0.0
+
+COURT_X_MIN       = -3.5
+COURT_X_MAX       =  3.5
+BOT_Y_MAX         = 12.2     #BotHitController.courtMaxZ
+BOT_INTERCEPT_Z   = (0.45, 1.50)   #reachable strike height range (AI z)
+
+#Bounce threshold mode
+#"relative": use full ball speed at impact (matches Unity m_BounceThreshold behavior
+#            — Unity compares relative speed of the two objects at contact;
+#            for a stationary floor, relative speed = ball speed)
+#"normal":   use only the normal component abs(vz) — physically purer but not Unity
+BOUNCE_THRESHOLD_MODE = "relative"
+
+ATTEMPT_BUDGET    = 65_000
 
 
+#Hit formula (Player.cs / Bot.cs / BotHitController.cs)
+#velocity = dir.normalized * hitForce + Vector3.up * upForce
+#Vector3.up = +z in AI frame (height axis)
 def hit_velocity(contact, target, hit_force, up_force):
-    dx, dy, dz = target[0]-contact[0], target[1]-contact[1], target[2]-contact[2]
+    dx = target[0] - contact[0]
+    dy = target[1] - contact[1]
+    dz = target[2] - contact[2]
     dist = math.sqrt(dx*dx + dy*dy + dz*dz) or 1e-6
     vx = (dx/dist) * hit_force
-    vy = (dy/dist) * hit_force + up_force
-    vz = (dz/dist) * hit_force
+    vy = (dy/dist) * hit_force
+    vz = (dz/dist) * hit_force + up_force   #upForce adds to height (AI z)
     spd = math.sqrt(vx*vx + vy*vy + vz*vz)
     if spd > MAX_BALL_SPEED:
         s = MAX_BALL_SPEED / spd
@@ -91,231 +73,269 @@ def hit_velocity(contact, target, hit_force, up_force):
     return vx, vy, vz
 
 
+#Min upForce to clear net (generator only, uses NET_CLEARANCE_Z)
 def compute_min_upforce(contact, target, hf):
     x_c, y_c, z_c = contact
-    dx, dy, dz = target[0]-x_c, target[1]-y_c, target[2]-z_c
+    dx = target[0] - x_c
+    dy = target[1] - y_c
+    dz = target[2] - z_c
     dist = math.sqrt(dx*dx + dy*dy + dz*dz) or 1e-6
-    vz_dir = (dz/dist) * hf
-    if z_c >= NET_Z:
+    vy_dir = (dy/dist) * hf    #depth component of velocity
+    if y_c >= NET_Y:
         return 0.0
-    if vz_dir < 0.5:
+    if vy_dir < 0.5:
         return None
-    t = (NET_Z - z_c) / vz_dir
+    t = (NET_Y - y_c) / vy_dir
     if t < 1e-6:
         return 0.0
-    vy_needed = (NET_CLEARANCE - y_c + 0.5 * abs(GRAVITY) * t * t) / t
-    return vy_needed - (dy/dist) * hf
+    #kinematic: z_net = z_c + vz*t + 0.5*GRAVITY*t^2 (GRAVITY is negative)
+    #solving for vz: vz_needed = (NET_CLEARANCE_Z - z_c - 0.5*GRAVITY*t^2) / t
+    vz_needed = (NET_CLEARANCE_Z - z_c - 0.5 * GRAVITY * t * t) / t
+    return vz_needed - (dz/dist) * hf
 
 
 def ensure_net_clearance(contact, target, hf, uf0, max_iters=10):
     uf = uf0
-    z_c, y_c = contact[2], contact[1]
+    y_c, z_c = contact[1], contact[2]
     for _ in range(max_iters):
         vx, vy, vz = hit_velocity(contact, target, hf, uf)
-        if z_c < NET_Z:
-            if vz <= 0.5:
+        if y_c < NET_Y:
+            if vy <= 0.5:
                 return None
-            t = (NET_Z - z_c) / vz
+            t = (NET_Y - y_c) / vy
         else:
-            if vz >= -0.5:
+            if vy >= -0.5:
                 return None
-            t = (z_c - NET_Z) / abs(vz)
+            t = (y_c - NET_Y) / abs(vy)
         if t <= 0:
             return uf
-        y_net = y_c + vy*t + 0.5*GRAVITY*t*t
-        if y_net >= NET_CLEARANCE:
+        z_net = z_c + vz*t + 0.5*GRAVITY*t*t
+        if z_net >= NET_CLEARANCE_Z:
             return uf
-        uf += (NET_CLEARANCE - y_net) / max(t, 1e-3)
+        uf += (NET_CLEARANCE_Z - z_net) / max(t, 1e-3)
         uf = min(uf, 15.0)
     return None
 
 
+#Simulator
+#AI frame: x=right, y=depth, z=height
+#Gravity on z. Net crossing on y. Floor bounce on z=0.
 def simulate_to_bot(x0, y0, z0, vx0, vy0, vz0, wx0, wy0, wz0):
     BOUNCE_E, BOUNCE_MU, _ = get_profile()
     x, y, z    = float(x0), float(y0), float(z0)
     vx, vy, vz = float(vx0), float(vy0), float(vz0)
     wx, wy, wz = float(wx0), float(wy0), float(wz0)
-    prev_y, prev_z = y, z
+    prev_y, prev_z, prev_x = y, z, x
     net_crossed  = False
     bounced      = False
     bounce_pos   = None
-    bounce_vy_in = None
-    net_y        = None
+    bounce_vz_in = None
+    net_z        = None
     t_net        = None
     ang_decay    = 1.0 - ANGULAR_DRAG * SIM_DT
 
     for tick in range(2000):
         spd  = math.sqrt(vx*vx + vy*vy + vz*vz)
         drag = DRAG_COEFF * spd
+        #Drag + Magnus. Gravity on z only.
         ax = -vx*drag + (wy*vz - wz*vy) * MAGNUS_COEFF
-        ay =  GRAVITY - vy*drag + (wz*vx - wx*vz) * MAGNUS_COEFF
-        az = -vz*drag + (wx*vy - wy*vx) * MAGNUS_COEFF
+        ay = -vy*drag + (wz*vx - wx*vz) * MAGNUS_COEFF
+        az =  GRAVITY - vz*drag + (wx*vy - wy*vx) * MAGNUS_COEFF
 
-        prev_y, prev_z = y, z
+        #Semi-implicit Euler: velocity first, then position
+        prev_y, prev_z, prev_x = y, z, x
         vx += ax*SIM_DT;  vy += ay*SIM_DT;  vz += az*SIM_DT
         x  += vx*SIM_DT;  y  += vy*SIM_DT;  z  += vz*SIM_DT
 
+        #Angular drag + clamp
         wx *= ang_decay;  wy *= ang_decay;  wz *= ang_decay
         om = math.sqrt(wx*wx + wy*wy + wz*wz)
         if om > MAX_ANGULAR_SPEED:
             s = MAX_ANGULAR_SPEED / om
             wx *= s;  wy *= s;  wz *= s
 
-        if not net_crossed and prev_z < NET_Z <= z:
-            frac  = (NET_Z - prev_z) / max(z - prev_z, 1e-9)
-            net_y = prev_y + frac * (y - prev_y)
-            t_net = round((tick + 1) * SIM_DT, 3)
-            if net_y < NET_HEIGHT:
+        #Net check: y crosses NET_Y. Ball must clear NET_TOP_Z.
+        if not net_crossed and prev_y < NET_Y <= y:
+            frac  = (NET_Y - prev_y) / max(y - prev_y, 1e-9)
+            net_z = prev_z + frac * (z - prev_z)
+            t_net = round(tick * SIM_DT + frac * SIM_DT, 4)   #interpolated
+            if net_z < NET_TOP_Z:
                 return None
             net_crossed = True
 
         if not net_crossed:
             continue
 
-        if abs(x) > COURT_X_HALF + 0.2:
+        #Bounds
+        if x < COURT_X_MIN - 0.2 or x > COURT_X_MAX + 0.2:
             return None
-        if z > BOT_BASELINE + 0.5:
+        if y > BOT_Y_MAX + 0.5:
             return None
 
-        if not bounced and prev_y > 0 >= y:
-            if not (NET_Z < z <= BOT_BASELINE and abs(x) <= COURT_X_HALF):
+        #Floor bounce: z crosses 0 on bot side
+        if not bounced and prev_z > FLOOR_Z >= z:
+            if not (NET_Y < y <= BOT_Y_MAX and COURT_X_MIN <= x <= COURT_X_MAX):
                 return None
-            vy_impact = abs(vy)
-            if vy_impact < BOUNCE_THRESHOLD:
-                return None
-            y  = 0.02
-            vy = vy_impact * BOUNCE_E
+
+            #Threshold check (point 3: Unity uses full relative speed)
+            impact_speed = math.sqrt(vx*vx + vy*vy + vz*vz)  #relative to stationary floor
+            vz_impact    = abs(vz)                             #normal component only
+            if BOUNCE_THRESHOLD_MODE == "relative":
+                if impact_speed < BOUNCE_THRESHOLD:
+                    return None
+            else:
+                if vz_impact < BOUNCE_THRESHOLD:
+                    return None
+
+            z  = 0.02
+            vz = vz_impact * BOUNCE_E     #COR applied to normal component only
             if BOUNCE_MU > 0:
-                delta_vn   = vy_impact * (1 + BOUNCE_E)
+                delta_vn   = vz_impact * (1 + BOUNCE_E)
                 max_dv_lat = BOUNCE_MU * delta_vn
-                fx = math.copysign(min(abs(vx), max_dv_lat * 0.707), vx)
-                fz = math.copysign(min(abs(vz), max_dv_lat * 0.707), vz)
-                vx -= fx;  vz -= fz
-                spin_damp = min(1.0, max_dv_lat / (math.sqrt(vx*vx + vz*vz) + 1e-6))
+                vt = math.sqrt(vx*vx + vy*vy)    #pre-scale tangential speed
+                if vt > 1e-9:
+                    dv = min(vt, max_dv_lat)
+                    scale = (vt - dv) / vt
+                    vx *= scale;  vy *= scale
+                #Spin damp uses pre-scale vt so ratio is consistent
+                spin_damp = min(1.0, max_dv_lat / (vt + 1e-6))
                 wx *= (1.0 - spin_damp * 0.3)
+                wy *= (1.0 - spin_damp * 0.3)
                 wz *= (1.0 - spin_damp * 0.3)
-            bounce_vy_in = round(vy_impact, 4)
+            bounce_vz_in = round(vz_impact, 4)
             bounced      = True
-            bounce_pos   = (round(x, 4), 0.0, round(z, 4))
+            bounce_pos   = (round(x, 4), round(y, 4), FLOOR_Z)
             continue
 
-        if bounced and y <= 0:
+        if bounced and z <= FLOOR_Z:
             return None
 
-        if prev_z < BOT_INTERCEPT_Z <= z:
-            frac = (BOT_INTERCEPT_Z - prev_z) / max(z - prev_z, 1e-9)
-            yi   = prev_y + frac * (y - prev_y)
-            y_lo, y_hi = BOT_INTERCEPT_Y
-            if not (y_lo <= yi <= y_hi):
-                return None
-            xi = x - frac * (x - (x - vx * SIM_DT))
+        #Intercept: first tick in bot territory at reachable height
+        #vz <= 0.2 excludes strongly-rising shots for more realistic contact timing
+        z_lo, z_hi = BOT_INTERCEPT_Z
+        if (y > NET_Y + 0.1
+                and z_lo <= z <= z_hi
+                and COURT_X_MIN <= x <= COURT_X_MAX
+                and vz <= 0.2):
             return dict(
-                contact_pos  = (round(xi, 4), round(yi, 4), BOT_INTERCEPT_Z),
+                contact_pos  = (round(x, 4), round(y, 4), round(z, 4)),
                 contact_vel  = (round(vx, 4), round(vy, 4), round(vz, 4)),
                 bounced      = bounced,
                 bounce_pos   = bounce_pos,
-                bounce_vy_in = bounce_vy_in,
-                net_y        = round(net_y, 4) if net_y else None,
+                bounce_vz_in = bounce_vz_in,
+                net_z        = round(net_z, 4) if net_z is not None else None,
                 t_net        = t_net,
-                t_flight     = round((tick + 1 - frac) * SIM_DT, 3),
+                t_flight     = round((tick + 1) * SIM_DT, 3),
             )
 
     return None
 
 
+#Bot shot policy
 def choose_bot_shot(contact_pos, contact_vel, bounced):
-    """
-    Realistic shot selection. Most boundaries use y_c/x_c (not in model inputs)
-    alongside contact_vel features — model must infer position, giving ~88-93% F1.
-    """
     vx, vy, vz = contact_vel
     spd = math.sqrt(vx*vx + vy*vy + vz*vz)
-    x_c, y_c = contact_pos[0], contact_pos[1]
+    x_c, y_c, z_c = contact_pos   #y_c=depth, z_c=height
+
+    deep = y_c > 8.0       #ball arrived deep, bot is under pressure
+    low  = z_c < 0.75      #ball at low contact height
+    high = z_c >= 1.10     #ball at high contact height
 
     if not bounced:
+        if deep:
+            return "Drive" if high else "Lob"
         if spd >= 14.0:
-            # Very fast volley: HandBattle only if central + high, else SpeedUp
-            return "HandBattle" if abs(x_c) < 1.5 and y_c >= 1.0 else "SpeedUp"
+            return "HandBattle" if abs(x_c) < 1.5 else "SpeedUp"
         elif spd >= 10.0:
-            # Fast volley: BOTH vy AND y_c decide — creates genuine inference difficulty
-            if vy < -1.0:             # steeply falling → always SpeedUp
+            if high:
+                return "Drive"
+            elif low:
                 return "SpeedUp"
-            elif y_c < 0.8:           # low contact, not steeply falling → SpeedUp
-                return "SpeedUp"
-            else:                     # moderate height + not steep → Dink
+            else:
                 return "Dink"
         elif spd >= 6.0:
-            # Medium volley: y_c split — low = Drop, high = Dink
-            return "Dink" if y_c >= 0.85 else "Drop"
+            if low:
+                return "Drop"
+            elif high:
+                return "Lob"
+            else:
+                return "Dink"
         else:
-            return "Dink"
+            return "Lob" if high else "Drop"
     else:
+        #Post-bounce
         if spd >= 8.0:
-            # Fast bounce: y_c decides Drive vs SpeedUp
-            return "Drive" if y_c >= 1.0 else "SpeedUp"
+            return "Drive" if high else "SpeedUp"
         elif spd >= 5.0:
-            # Medium bounce: y_c and x_c both matter
-            if y_c >= 1.0:
+            if high:
                 return "Drive"
             elif abs(x_c) < 1.5:
                 return "Drop"
             else:
                 return "Lob"
         else:
-            # Slow bounce: y_c decides Lob vs Drop
-            return "Lob" if y_c < 0.9 else "Drop"
+            return "Lob" if low else "Drop"
 
 
+#Bot return target ranges in AI frame: (x_range, z_range(height), y_target(depth), hf_range, extra_arc)
+#Targets are on player side so y_target < NET_Y, vy_out will be negative.
 BOT_RETURN_CFG = {
-    "Drive":     ((-3.0, 3.0), (0.05, 0.50), (-3.5,  0.5), (12, 20), (0.0, 2.0)),
-    "Drop":      ((-2.5, 2.5), (0.05, 0.20), ( 1.5,  3.5), ( 3,  8), (0.5, 3.0)),
-    "Dink":      ((-2.5, 2.5), (0.05, 0.20), ( 1.5,  3.5), ( 1,  5), (0.2, 1.5)),
-    "Lob":       ((-2.5, 2.5), (0.05, 0.50), (-3.5, -0.5), ( 5, 10), (3.5, 7.0)),
-    "SpeedUp":   ((-2.5, 2.5), (0.50, 1.20), (-1.0,  3.0), ( 9, 16), (0.0, 1.0)),
-    "HandBattle":((-2.5, 2.5), (0.50, 1.20), (-0.5,  2.5), (12, 20), (0.0, 0.5)),
+    "Drive":     ((-3.0, 3.0), (0.05, 0.50), (0.5,  4.5), (12, 20), (0.0, 2.0)),
+    "Drop":      ((-2.5, 2.5), (0.05, 0.20), (2.0,  4.5), ( 3,  8), (0.5, 3.0)),
+    "Dink":      ((-2.5, 2.5), (0.05, 0.20), (2.0,  5.0), ( 1,  5), (0.2, 1.5)),
+    "Lob":       ((-2.5, 2.5), (0.05, 0.50), (-2.0, 3.0), ( 5, 10), (6.0, 10.0)),
+    "SpeedUp":   ((-2.5, 2.5), (0.50, 1.20), (1.0,  4.0), ( 9, 16), (0.0, 1.0)),
+    "HandBattle":((-2.5, 2.5), (0.50, 1.20), (2.0,  5.0), (12, 20), (0.0, 0.5)),
 }
 
 
-def make_bot_return(contact_pos, shot_type):
+def make_bot_return(contact_pos, shot_type, rng):
     cfg = BOT_RETURN_CFG[shot_type]
     x_c, y_c, z_c = contact_pos
-    # Aim cross-court (opposite x from contact) — deterministic, varies with input
-    x_t = float(max(cfg[0][0], min(cfg[0][1], -x_c)))
-    y_t = (cfg[1][0] + cfg[1][1]) / 2
-    z_t = (cfg[2][0] + cfg[2][1]) / 2
-    hf  = (cfg[3][0] + cfg[3][1]) / 2
-    extra = (cfg[4][0] + cfg[4][1]) / 2
-    dx, dy, dz = x_t - x_c, y_t - y_c, z_t - z_c
-    dist = math.sqrt(dx*dx + dy*dy + dz*dz) or 1e-6
-    vz_dir = (dz / dist) * hf
-    if vz_dir < -0.5:
-        t_net = (z_c - NET_Z) / abs(vz_dir)
-        if t_net >= 0.05:
-            vy_needed = (NET_CLEARANCE - y_c + 0.5 * abs(GRAVITY) * t_net**2) / t_net
-            uf = (vy_needed - (dy / dist) * hf) + extra
-            uf = ensure_net_clearance(contact_pos, (x_t, y_t, z_t), hf, uf)
-            if uf is not None:
-                uf = max(-3.0, min(uf, 12.0))
-                return hit_velocity(contact_pos, (x_t, y_t, z_t), hf, uf)
-    return hit_velocity(contact_pos, (0.0, 0.5, -2.0), 12.0, 2.0)
+    for _ in range(20):
+        x_t   = float(rng.uniform(*cfg[0]))
+        z_t   = float(rng.uniform(*cfg[1]))
+        y_t   = float(rng.uniform(*cfg[2]))
+        hf    = float(rng.uniform(*cfg[3]))
+        extra = float(rng.uniform(*cfg[4]))
+        dx = x_t - x_c;  dy = y_t - y_c;  dz = z_t - z_c
+        dist = math.sqrt(dx*dx + dy*dy + dz*dz) or 1e-6
+        vy_dir = (dy/dist) * hf
+        if vy_dir > -0.5:
+            continue
+        t_net = (y_c - NET_Y) / abs(vy_dir)
+        if t_net < 0.05:
+            continue
+        vz_needed = (NET_CLEARANCE_Z - z_c - 0.5 * GRAVITY * t_net**2) / t_net
+        uf = (vz_needed - (dz/dist) * hf) + extra
+        uf = ensure_net_clearance(contact_pos, (x_t, y_t, z_t), hf, uf)
+        if uf is None:
+            continue
+        uf = max(-3.0, min(uf, 12.0))
+        return hit_velocity(contact_pos, (x_t, y_t, z_t), hf, uf)
+    return None   #caller must discard this row — no fallback to avoid label mismatch
 
 
+#Player shot configs in AI frame
+#y_c: contact depth (AI y)  y_t: target depth on bot side (AI y > NET_Y)
+#z_c: contact height (AI z)  z_t: target height (AI z)
 PLAYER_SHOTS = {
-    "Drive":     dict(z_c=(-2.0, 1.5), y_c=(0.50, 1.30), z_t=(7.0, 11.0), y_t=(0.05, 0.50),
+    "Drive":     dict(y_c=(-2.0, 1.5), z_c=(0.50, 1.30), y_t=(7.0, 11.0), z_t=(0.05, 0.50),
                       hf=(12, 20), extra_arc=(0.0,  2.0), ox=(20,  50), oy=(-8,  8), oz=(-3, 3)),
-    "Drop":      dict(z_c=(-3.5, 0.0), y_c=(0.50, 1.40), z_t=(4.2,  5.5), y_t=(0.05, 0.20),
+    "Drop":      dict(y_c=(-3.5, 0.0), z_c=(0.50, 1.40), y_t=(6.5,  8.5), z_t=(0.05, 0.30),
                       hf=( 4,  9), extra_arc=(0.5,  3.5), ox=(-15,  5), oy=(-5,  5), oz=(-3, 3)),
-    "Dink":      dict(z_c=( 1.7, 3.5), y_c=(0.30, 1.00), z_t=(4.2,  5.8), y_t=(0.05, 0.20),
+    "Dink":      dict(y_c=( 1.7, 5.0), z_c=(0.30, 1.00), y_t=(6.0,  7.5), z_t=(0.05, 0.30),
                       hf=( 1,  5), extra_arc=(0.2,  2.0), ox=( -8,  8), oy=(-4,  4), oz=(-2, 2)),
-    "Lob":       dict(z_c=(-2.0, 3.8), y_c=(0.50, 1.50), z_t=(9.0, 11.5), y_t=(0.05, 0.50),
-                      hf=( 5, 10), extra_arc=(3.5,  8.0), ox=(-40,-10), oy=(-5,  5), oz=(-3, 3)),
-    "SpeedUp":   dict(z_c=( 2.0, 2.9), y_c=(0.50, 1.30), z_t=(5.0,  7.5), y_t=(0.50, 1.00),
+    "Lob":       dict(y_c=(-2.0, 4.5), z_c=(0.50, 1.50), y_t=(9.0, 11.5), z_t=(0.05, 0.50),
+                      hf=( 7, 12), extra_arc=(8.0, 12.0), ox=(-40,-10), oy=(-5,  5), oz=(-3, 3)),
+    "SpeedUp":   dict(y_c=( 2.0, 4.5), z_c=(0.50, 1.30), y_t=(6.0,  8.5), z_t=(0.50, 1.00),
                       hf=( 9, 16), extra_arc=(0.0,  1.2), ox=( 15, 40), oy=(-8,  8), oz=(-3, 3)),
-    "HandBattle":dict(z_c=( 3.0, 3.9), y_c=(0.50, 1.30), z_t=(4.5,  6.5), y_t=(0.50, 1.20),
+    "HandBattle":dict(y_c=( 3.5, 5.2), z_c=(0.50, 1.30), y_t=(5.8,  8.0), z_t=(0.50, 1.20),
                       hf=(12, 20), extra_arc=(-0.3, 0.5), ox=(-15, 30), oy=(-10,10), oz=(-3, 3)),
 }
 
 
+#Generator
 def generate_dataset(budget=ATTEMPT_BUDGET, seed=42):
     rng = np.random.default_rng(seed)
     rows = []
@@ -328,16 +348,16 @@ def generate_dataset(budget=ATTEMPT_BUDGET, seed=42):
         p = PLAYER_SHOTS[ps_name]
         total += 1
 
-        x_c = float(rng.uniform(-COURT_X_HALF, COURT_X_HALF))
-        y_c = float(rng.uniform(*p["y_c"]))
-        z_c = float(rng.uniform(*p["z_c"]))
-        x_t = float(rng.uniform(-COURT_X_HALF, COURT_X_HALF))
-        y_t = float(rng.uniform(*p["y_t"]))
-        z_t = float(rng.uniform(*p["z_t"]))
-        hf  = float(rng.uniform(*p["hf"]))
-        ox  = float(np.clip(rng.uniform(*p["ox"]), -MAX_ANGULAR_SPEED, MAX_ANGULAR_SPEED))
-        oy  = float(np.clip(rng.uniform(*p["oy"]), -MAX_ANGULAR_SPEED, MAX_ANGULAR_SPEED))
-        oz  = float(np.clip(rng.uniform(*p["oz"]), -MAX_ANGULAR_SPEED, MAX_ANGULAR_SPEED))
+        x_c  = float(rng.uniform(COURT_X_MIN, COURT_X_MAX))
+        y_c  = float(rng.uniform(*p["y_c"]))
+        z_c  = float(rng.uniform(*p["z_c"]))
+        x_t  = float(rng.uniform(COURT_X_MIN, COURT_X_MAX))
+        y_t  = float(rng.uniform(*p["y_t"]))
+        z_t  = float(rng.uniform(*p["z_t"]))
+        hf   = float(rng.uniform(*p["hf"]))
+        ox   = float(np.clip(rng.uniform(*p["ox"]), -MAX_ANGULAR_SPEED, MAX_ANGULAR_SPEED))
+        oy   = float(np.clip(rng.uniform(*p["oy"]), -MAX_ANGULAR_SPEED, MAX_ANGULAR_SPEED))
+        oz   = float(np.clip(rng.uniform(*p["oz"]), -MAX_ANGULAR_SPEED, MAX_ANGULAR_SPEED))
 
         min_uf = compute_min_upforce((x_c, y_c, z_c), (x_t, y_t, z_t), hf)
         if min_uf is None:
@@ -356,27 +376,33 @@ def generate_dataset(budget=ATTEMPT_BUDGET, seed=42):
         cv   = result["contact_vel"]
         bnc  = result["bounced"]
         bpos = result["bounce_pos"]
-        bvyi = result["bounce_vy_in"]
-        ny   = result["net_y"]
+        bvzi = result["bounce_vz_in"]
+        nz   = result["net_z"]
         t_n  = result["t_net"]
         tfl  = result["t_flight"]
 
         shot_type = choose_bot_shot(cp, cv, bnc)
-        vxo, vyo, vzo = make_bot_return(cp, shot_type)
+        ret = make_bot_return(cp, shot_type, rng)
+        if ret is None:
+            faults += 1; continue
+        vxo, vyo, vzo = ret
 
         rows.append({
             "x":  round(x_c, 4), "y":  round(y_c, 4), "z":  round(z_c, 4),
             "vx": round(vx,  4), "vy": round(vy,  4), "vz": round(vz,  4),
+            "contact_vx": round(cv[0], 4),
+            "contact_vy": round(cv[1], 4),
+            "contact_vz": round(cv[2], 4),
+            "bounced":    float(bnc),
             "x_out":  round(cp[0], 4), "y_out": round(cp[1], 4), "z_out": round(cp[2], 4),
             "vx_out": round(vxo,   4), "vy_out":round(vyo,   4), "vz_out":round(vzo,   4),
             "shot_type": shot_type,
             "_player_shot":  ps_name,
-            "_bounced":      bnc,
             "_bounce_x":     round(bpos[0], 4) if bpos else None,
-            "_bounce_z":     round(bpos[2], 4) if bpos else None,
-            "_bounce_vy_in": bvyi,
-            "_net_y":        round(ny, 4) if ny else None,
-            "_net_clear_m":  round(ny - NET_HEIGHT, 4) if ny else None,
+            "_bounce_y":     round(bpos[1], 4) if bpos else None,
+            "_bounce_vz_in": bvzi,
+            "_net_z":        round(nz, 4) if nz is not None else None,
+            "_net_clear_m":  round(nz - NET_TOP_Z, 4) if nz is not None else None,
             "_t_net":        t_n,
             "_t_to_bot":     tfl,
             "_omega_x":      round(ox, 2),
@@ -385,13 +411,6 @@ def generate_dataset(budget=ATTEMPT_BUDGET, seed=42):
             "_profile":      PHYSICS_PROFILE,
             "_bounce_e":     BOUNCE_E,
             "_bounce_mu":    BOUNCE_MU,
-            "_contact_vx":   round(cv[0], 4),
-            "_contact_vy":   round(cv[1], 4),
-            "_contact_vz":   round(cv[2], 4),
-            "contact_vx":    round(cv[0], 4),
-            "contact_vy":    round(cv[1], 4),
-            "contact_vz":    round(cv[2], 4),
-            "bounced":       float(bnc),
         })
 
     df = pd.DataFrame(rows).sample(frac=1, random_state=seed).reset_index(drop=True)
@@ -399,36 +418,28 @@ def generate_dataset(budget=ATTEMPT_BUDGET, seed=42):
 
 
 TRAIN_COLS = [
+    #Player hit state at moment of contact (model input for full pipeline)
     "x", "y", "z", "vx", "vy", "vz",
+    #Ball state at bot intercept (arrival features, use as inputs for policy-only model; omit player hit state to avoid leakage)
     "contact_vx", "contact_vy", "contact_vz", "bounced",
+    #Bot output: intercept position, return velocity, shot choice
     "x_out", "y_out", "z_out", "vx_out", "vy_out", "vz_out",
     "shot_type",
 ]
-
-POLICY_COLS = [
-    "x_out", "y_out", "z_out",
-    "_contact_vx", "_contact_vy", "_contact_vz",
-    "_bounced",
-    "shot_type",
-]
-
-POLICY_RENAME = {
-    "x_out": "x_intercept", "y_out": "y_intercept", "z_out": "z_intercept",
-    "_contact_vx": "vx_arrive", "_contact_vy": "vy_arrive", "_contact_vz": "vz_arrive",
-    "_bounced": "bounced",
-}
 
 
 def print_sanity(df):
     BOUNCE_E, BOUNCE_MU, _ = get_profile()
     checks = [
-        ("vz > 0",                (df.vz > 0).all()),
-        ("vz_out < 0",            (df.vz_out < 0).all()),
-        ("z < 4",                 (df.z < NET_Z).all()),
-        (f"z_out == {BOT_INTERCEPT_Z}", (df.z_out == BOT_INTERCEPT_Z).all()),
-        ("y in [0.25, 2.0]",      ((df.y >= 0.25) & (df.y <= 2.0)).all()),
-        ("y_out in [0.45, 1.50]", ((df.y_out >= 0.44) & (df.y_out <= 1.51)).all()),
-        ("net_clear_m >= 0.0",    (df["_net_clear_m"] >= 0.0).all()),
+        ("vy > 0  (player hits toward bot, +depth)",   (df.vy > 0).all()),
+        ("vy_out < 0  (bot returns to player, -depth)", (df.vy_out < 0).all()),
+        ("y < NET_Y  (player side)",                    (df.y < NET_Y).all()),
+        ("y_out > NET_Y  (bot side)",                   (df.y_out > NET_Y).all()),
+        ("z > 0  (contact above floor)",                (df.z > 0).all()),
+        ("z_out in BOT_INTERCEPT_Z",                   ((df.z_out >= BOT_INTERCEPT_Z[0]) &
+                                                         (df.z_out <= BOT_INTERCEPT_Z[1])).all()),
+        ("net_clear_m >= 0.0",                          (df["_net_clear_m"] >= 0.0).all()),
+        ("_t_net not null  (net always crossed)",        df["_t_net"].notna().all()),
     ]
     si = (df.vx**2 + df.vy**2 + df.vz**2)**0.5
     so = (df.vx_out**2 + df.vy_out**2 + df.vz_out**2)**0.5
@@ -440,7 +451,7 @@ def print_sanity(df):
     for label, ok in checks:
         print(f"  {'PASS' if ok else 'FAIL'}  {label}")
 
-    pct = df["_bounced"].mean() * 100
+    pct = df["bounced"].mean() * 100
     print(f"\nProfile:       {PHYSICS_PROFILE}  COR={BOUNCE_E}  mu={BOUNCE_MU}")
     print(f"Bounced:       {pct:.1f}%  Volleyed: {100-pct:.1f}%")
     print(f"Net clear (m): min={df['_net_clear_m'].min():.3f}"
@@ -466,15 +477,17 @@ def print_sanity(df):
             continue
         spd = (g.vx_out**2 + g.vy_out**2 + g.vz_out**2)**0.5
         print(f"  {shot:12s}  {len(g):6d}  "
-              f"{spd.min():5.1f} – {spd.max():5.1f}  "
-              f"{g.vy_out.min():5.1f} – {g.vy_out.max():5.1f}")
+              f"{spd.min():5.1f} - {spd.max():5.1f}  "
+              f"{g.vy_out.min():5.1f} - {g.vy_out.max():5.1f}")
 
 
 if __name__ == "__main__":
     _, _, profile_note = get_profile()
     t0 = time.time()
-    print(f"Pickleball Dataset Generator v1.0")
-    print(f"Profile: {PHYSICS_PROFILE} — {profile_note}")
+    print(f"Pickleball Dataset Generator v1.1")
+    print(f"Coordinate frame: x=right  y=depth  z=height  (matches MqttController.cs)")
+    print(f"Net at AI y={NET_Y}  top AI z={NET_TOP_Z}  intercept first-reachable in bot territory")
+    print(f"Profile: {PHYSICS_PROFILE} - {profile_note}")
     print(f"Budget:  {ATTEMPT_BUDGET} attempts")
 
     df, faults, total = generate_dataset()
@@ -484,23 +497,22 @@ if __name__ == "__main__":
 
     print_sanity(df)
 
-    df_train  = df[TRAIN_COLS]
-    df_policy = df[POLICY_COLS].rename(columns=POLICY_RENAME)
+    df_train = df[TRAIN_COLS]
     DEBUG_COLS = TRAIN_COLS + [c for c in df.columns if c.startswith("_")]
     df_debug  = df[DEBUG_COLS]
+
+    print(f"\nSample training rows:")
+    print(df_train.head(6).to_string(index=False))
 
     out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
     os.makedirs(out_dir, exist_ok=True)
 
-    out_train  = os.path.join(out_dir, "pickleball_shot_dataset.csv")
-    out_policy = os.path.join(out_dir, "pickleball_policy_dataset.csv")
-    out_debug  = os.path.join(out_dir, "pickleball_shot_dataset_debug.csv")
+    out_train = os.path.join(out_dir, "pickleball_shot_dataset.csv")
+    out_debug = os.path.join(out_dir, "pickleball_shot_dataset_debug.csv")
 
-    df_train.to_csv(out_train,  index=False)
-    df_policy.to_csv(out_policy, index=False)
-    df_debug.to_csv(out_debug,  index=False)
+    df_train.to_csv(out_train, index=False)
+    df_debug.to_csv(out_debug, index=False)
 
     print(f"\nSaved:")
-    print(f"  {out_train}   ({len(df_train):,} rows x 13 cols)")
-    print(f"  {out_policy}  ({len(df_policy):,} rows x {len(df_policy.columns)} cols)")
+    print(f"  {out_train}   ({len(df_train):,} rows x {len(df_train.columns)} cols)")
     print(f"  {out_debug}   ({len(df_debug):,} rows x {len(df_debug.columns)} cols)")
